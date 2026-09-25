@@ -23,6 +23,9 @@ class ChangeOut(BaseModel):
 
 class FileOut(BaseModel):
     name: str
+    entry_index: int = Field(
+        description="ZIP 条目序号（0 基，按中央目录顺序）；同名条目以此区分"
+    )
     status: str = Field(description="ok | warning | error | skipped")
     output_name: Optional[str] = None
     patient_key: Optional[str] = None

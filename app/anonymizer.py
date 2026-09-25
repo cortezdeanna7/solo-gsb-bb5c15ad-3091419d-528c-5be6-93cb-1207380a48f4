@@ -1,7 +1,8 @@
 """DICOM 批量匿名化核心引擎。
 
 职责：
-1. 安全解压 ZIP（路径穿越 / zip 炸弹 / 符号链接防护）；
+1. 安全解压 ZIP（路径穿越 / zip 炸弹 / 符号链接防护；逐条目独立暂存，
+   同名或规范化后同址的条目互不覆盖）；
 2. 扫描全部文件，识别非法 DICOM，按患者身份分组并建立 UID 全局映射；
 3. 重写 Patient / Study / Series / SOP / FrameOfReference UID 及身份字段，
    递归处理所有序列内的 UID 引用，保证检查关系不变；
@@ -14,6 +15,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -73,6 +75,7 @@ class Change:
 class FileReport:
     name: str
     status: str  # ok | warning | error | skipped
+    entry_index: int = -1  # ZIP 条目序号（0 基，按中央目录顺序）；同名条目以此区分
     output_name: Optional[str] = None
     sop_instance_uid: Optional[str] = None
     study_instance_uid: Optional[str] = None
@@ -89,6 +92,7 @@ class FileReport:
         )
         return {
             "name": self.name,
+            "entry_index": self.entry_index,
             "status": self.status,
             "output_name": self.output_name,
             "patient_key": self.patient_key,
@@ -169,26 +173,41 @@ def _file_sha16(path: str) -> str:
 # --------------------------------------------------------------------------- #
 # ZIP 安全解压
 # --------------------------------------------------------------------------- #
+@dataclass
+class ExtractedEntry:
+    """一个 ZIP 条目对应的一份独立暂存文件。
+
+    同名（或 `./` 等规范化后同址）的条目各自解压到互不相同的暂存文件，
+    后续两遍扫描与匿名写出均按条目读取各自字节，避免相互覆盖。
+    """
+    index: int      # 条目在 ZIP 中央目录中的 0 基序号
+    name: str       # 原始成员名（未规范化，逐文件结果中回显）
+    staging: str    # 解压目录内的独立暂存相对路径（POSIX 分隔符）
+
+
 def safe_extract_zip(
     zip_path: str,
     dest: str,
     max_total_bytes: int,
     max_files: int,
-) -> list[str]:
-    """解压 ZIP，返回解压出的文件相对路径列表；带完整的安全校验。"""
+) -> list[ExtractedEntry]:
+    """解压 ZIP，返回条目列表（按 ZIP 中央目录顺序）；带完整的安全校验。
+
+    每个文件条目写入以条目序号命名的独立暂存文件，同名条目不再互相覆盖。
+    """
     try:
         zf = zipfile.ZipFile(zip_path)
     except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"无法打开 ZIP：{exc}") from exc
 
-    members: list[zipfile.ZipInfo] = []
+    members: list[tuple[int, zipfile.ZipInfo]] = []
     total = 0
     with zf:
         infos = zf.infolist()
         if len(infos) > max_files:
             raise ValueError(f"压缩包内文件数量超过上限 {max_files}")
         dest_abs = os.path.abspath(dest)
-        for info in infos:
+        for index, info in enumerate(infos):
             # 规范化后必须仍在目标目录内，防止 ../ 路径穿越与绝对路径
             target = os.path.abspath(os.path.join(dest, info.filename))
             if target != dest_abs and not target.startswith(dest_abs + os.sep):
@@ -211,23 +230,26 @@ def safe_extract_zip(
             total += info.file_size
             if total > max_total_bytes:
                 raise ValueError("解压后总大小超过上限（可能为 zip 炸弹）")
-            members.append(info)
+            members.append((index, info))
 
-        for info in members:
-            zf.extract(info, dest)
-            target = os.path.abspath(os.path.join(dest, info.filename))
+        # 逐条目写入独立暂存文件：暂存名只取决于条目序号，
+        # 同名 / 规范化后同址的条目因此互不覆盖
+        staging_dir = os.path.join(dest, "entries")
+        os.makedirs(staging_dir, exist_ok=True)
+        entries: list[ExtractedEntry] = []
+        for index, info in members:
+            rel_staging = f"entries/{index:06d}"
+            target = os.path.join(dest, rel_staging)
+            with zf.open(info, "r") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
             # 二次确认：解压后若磁盘上是符号链接，拒绝
             if os.path.islink(target):
                 raise ValueError(f"检测到符号链接：{info.filename}")
             os.chmod(target, 0o600)
-
-    rels = [
-        os.path.relpath(
-            os.path.abspath(os.path.join(dest, m.filename)), os.path.abspath(dest)
-        ).replace(os.sep, "/")
-        for m in members
-    ]
-    return sorted(rels)
+            entries.append(
+                ExtractedEntry(index=index, name=info.filename, staging=rel_staging)
+            )
+    return entries
 
 
 # --------------------------------------------------------------------------- #
@@ -546,7 +568,7 @@ class Anonymizer:
     def run(
         self,
         extracted_dir: str,
-        relative_paths: list[str],
+        entries: list[ExtractedEntry],
         output_dir: str,
     ) -> JobResult:
         os.makedirs(output_dir, exist_ok=True)
@@ -559,11 +581,14 @@ class Anonymizer:
         identities: dict[str, list[FileReport]] = {}
 
         # ---- 第一遍：识别 DICOM、收集 UID、患者分组 -------------------- #
-        for rel in relative_paths:
-            path = os.path.join(extracted_dir, rel)
-            report = FileReport(name=rel, status="ok")
+        # 每个 ZIP 条目读取各自的独立暂存文件，同名条目互不干扰
+        for entry in entries:
+            path = os.path.join(extracted_dir, entry.staging)
+            report = FileReport(
+                name=entry.name, status="ok", entry_index=entry.index
+            )
             reports.append(report)
-            if os.path.basename(rel).upper() == "DICOMDIR":
+            if os.path.basename(entry.name).upper() == "DICOMDIR":
                 report.status = "skipped"
                 report.diagnostics.append(
                     Diagnostic("DICOMDIR_SKIPPED", "info",

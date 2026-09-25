@@ -7,7 +7,7 @@ import zipfile
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.sample_data import build_sample_zip
+from tests.sample_data import _ct_like, build_sample_zip
 
 
 @pytest.fixture()
@@ -161,6 +161,45 @@ def test_same_secret_cross_batch_same_pseudonym(client, sample_zip_bytes):
     p1 = {p["key"]: p["new_patient_id"] for p in j1["patients"]}
     p2 = {p["key"]: p["new_patient_id"] for p in j2["patients"]}
     assert p1 == p2
+
+
+def test_duplicate_member_names_processed_independently(client):
+    """同一 ZIP 内两个同名条目（不同 SOP）：各自匿名化、各自写出。"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("scan.dcm", _ct_like(
+            "1.2.3.4.5.6.7.8.9.1.101", "1.9.9.2", "1.9.9.1",
+            "P-001", "Zhang^San", "1.9.9.3", pixels=bytes(range(32))))
+        zf.writestr("scan.dcm", _ct_like(
+            "1.2.3.4.5.6.7.8.9.1.102", "1.9.9.2", "1.9.9.1",
+            "P-001", "Zhang^San", "1.9.9.3", pixels=bytes(reversed(range(32)))))
+    r = client.post(
+        "/jobs",
+        files={"file": ("dup.zip", buf.getvalue(), "application/zip")},
+        data={"secret": "dup-name-secret-123"},
+    )
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["status"] == "ready"
+    assert job["file_count"] == 2
+    assert job["output_file_count"] == 2
+    # 原成员名相同，条目序号区分；两个不同 SOP 各自写出
+    assert [f["name"] for f in job["files"]] == ["scan.dcm", "scan.dcm"]
+    assert {f["entry_index"] for f in job["files"]} == {0, 1}
+    assert len({f["sop_instance_uid"] for f in job["files"]}) == 2
+    assert len({f["output_name"] for f in job["files"]}) == 2
+
+    # 下载的匿名 ZIP 含两个不同文件，像素各自对应输入条目
+    r2 = client.get(f"/jobs/{job['id']}/download")
+    assert r2.status_code == 200
+    import pydicom
+    pixels = set()
+    with zipfile.ZipFile(io.BytesIO(r2.content)) as zf:
+        assert len(zf.namelist()) == 2
+        for name in zf.namelist():
+            ds = pydicom.dcmread(io.BytesIO(zf.read(name)))
+            pixels.add(ds.PixelData)
+    assert pixels == {bytes(range(32)), bytes(reversed(range(32)))}
 
 
 # --------------------------------------------------------------------------- #

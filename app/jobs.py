@@ -87,7 +87,7 @@ class JobRegistry:
         shutil.move(upload_path, job.upload_path)
         try:
             os.makedirs(job.extract_dir, exist_ok=True)
-            members = anonymizer.safe_extract_zip(
+            entries = anonymizer.safe_extract_zip(
                 job.upload_path,
                 job.extract_dir,
                 max_total_bytes=settings.max_extracted_bytes,
@@ -99,7 +99,7 @@ class JobRegistry:
                 date_shift_min=date_shift_min,
                 date_shift_max=date_shift_max,
             )
-            job.result = engine.run(job.extract_dir, members, job.output_dir)
+            job.result = engine.run(job.extract_dir, entries, job.output_dir)
         except ValueError as exc:
             job.status = "failed"
             job.error = str(exc)

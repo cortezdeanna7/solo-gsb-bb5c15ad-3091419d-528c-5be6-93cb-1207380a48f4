@@ -11,7 +11,7 @@ import pytest
 from app.anonymizer import Anonymizer, build_zip, safe_extract_zip
 from app.config import settings
 
-from .sample_data import build_sample_zip
+from .sample_data import _ct_like, build_sample_zip
 
 SECRET = "unit-test-secret-0123456789"
 
@@ -326,3 +326,129 @@ def test_too_many_files_rejected(tmp_path):
     with pytest.raises(ValueError):
         safe_extract_zip(str(many), str(dest),
                          settings.max_extracted_bytes, max_files=3)
+
+
+def test_zip_absolute_path_rejected(tmp_path):
+    evil = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil, "w") as zf:
+        zf.writestr("/etc/passwd", b"x")
+    dest = tmp_path / "ex"
+    dest.mkdir()
+    with pytest.raises(ValueError):
+        safe_extract_zip(str(evil), str(dest),
+                         settings.max_extracted_bytes,
+                         settings.max_extracted_files)
+
+
+def test_zip_symlink_rejected(tmp_path):
+    link = tmp_path / "link.zip"
+    with zipfile.ZipFile(link, "w") as zf:
+        info = zipfile.ZipInfo("link.dcm")
+        info.external_attr = 0o120777 << 16  # Unix 文件类型：符号链接
+        zf.writestr(info, b"/etc/passwd")
+    dest = tmp_path / "ex"
+    dest.mkdir()
+    with pytest.raises(ValueError):
+        safe_extract_zip(str(link), str(dest),
+                         settings.max_extracted_bytes,
+                         settings.max_extracted_files)
+
+
+# --------------------------------------------------------------------------- #
+# ZIP 同名条目：逐条目独立暂存，两遍扫描与写出均读各自字节
+# --------------------------------------------------------------------------- #
+def _extract_members(tmp_path, members, tag="dup"):
+    """把 (成员名, 字节) 列表原样写入 ZIP（允许同名条目）并安全解压。"""
+    zp = tmp_path / f"{tag}.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        for name, blob in members:
+            zf.writestr(name, blob)
+    ex = tmp_path / f"{tag}-ex"
+    ex.mkdir()
+    entries = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    return str(ex), entries
+
+
+def _ct(sop_uid, pixels):
+    return _ct_like(sop_uid, "1.9.9.2", "1.9.9.1", "P-001", "Zhang^San",
+                    "1.9.9.3", pixels=pixels)
+
+
+def test_same_name_entries_extract_to_independent_staging(tmp_path):
+    ex, entries = _extract_members(
+        tmp_path, [("scan.dcm", b"first"), ("scan.dcm", b"second")]
+    )
+    assert [e.index for e in entries] == [0, 1]
+    assert [e.name for e in entries] == ["scan.dcm", "scan.dcm"]
+    assert entries[0].staging != entries[1].staging
+    for entry, expect in zip(entries, (b"first", b"second")):
+        with open(os.path.join(ex, entry.staging), "rb") as fh:
+            assert fh.read() == expect  # 后一条目不覆盖前一条目
+
+
+def test_same_name_different_sop_each_written(tmp_path):
+    pixels_a = bytes(range(32))
+    pixels_b = bytes(reversed(range(32)))
+    ex, entries = _extract_members(
+        tmp_path,
+        [("scan.dcm", _ct("1.2.3.4.5.6.7.8.9.1.101", pixels_a)),
+         ("scan.dcm", _ct("1.2.3.4.5.6.7.8.9.1.102", pixels_b))],
+    )
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+
+    assert len(result.files) == 2
+    assert [r.name for r in result.files] == ["scan.dcm", "scan.dcm"]
+    assert {r.entry_index for r in result.files} == {0, 1}
+    assert all(r.output_name for r in result.files)
+    # 同名不同 SOP：各自写出为不同的匿名文件
+    new_sops = {r.sop_instance_uid for r in result.files}
+    assert len(new_sops) == 2
+    assert {r.output_name for r in result.files} == {f"{u}.dcm" for u in new_sops}
+    # 两个原始 SOP 都进入映射表（第一遍按条目各自收集）
+    assert set(result.sops) == {"1.2.3.4.5.6.7.8.9.1.101",
+                                "1.2.3.4.5.6.7.8.9.1.102"}
+    # 输出像素与各自输入一致（第二遍读取各自暂存字节，而非末项重复）
+    pixels_by_index = {}
+    for r in result.files:
+        ds = pydicom.dcmread(os.path.join(result.output_dir, r.output_name))
+        pixels_by_index[r.entry_index] = ds.PixelData
+    assert pixels_by_index[0] == pixels_a
+    assert pixels_by_index[1] == pixels_b
+    # 两名条目属于同一患者，只归为一组
+    assert len(result.patients) == 1
+    assert next(iter(result.patients.values())).file_count == 2
+
+
+def test_normalized_same_address_entries_stay_independent(tmp_path):
+    """`./scan.dcm` 与 `scan.dcm` 规范化后同址，但仍按条目各自独立处理。"""
+    ex, entries = _extract_members(
+        tmp_path,
+        [("./scan.dcm", _ct("1.2.3.4.5.6.7.8.9.1.101", bytes(range(32)))),
+         ("scan.dcm", _ct("1.2.3.4.5.6.7.8.9.1.102", bytes(range(32))))],
+    )
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+    # 原成员名原样回显，条目序号可区分
+    assert [r.name for r in result.files] == ["./scan.dcm", "scan.dcm"]
+    assert {r.entry_index for r in result.files} == {0, 1}
+    assert len({r.sop_instance_uid for r in result.files}) == 2
+    assert all(r.output_name for r in result.files)
+
+
+def test_same_name_same_sop_uses_duplicate_rule(tmp_path):
+    """同名且同 SOPInstanceUID：沿用现有重复实例规则（改名 + 警告）。"""
+    blob = _ct("1.2.3.4.5.6.7.8.9.1.101", bytes(range(32)))
+    ex, entries = _extract_members(
+        tmp_path, [("scan.dcm", blob), ("scan.dcm", blob)]
+    )
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+
+    assert len(result.files) == 2
+    new_sop = result.files[0].sop_instance_uid
+    assert result.files[1].sop_instance_uid == new_sop
+    outputs = sorted(r.output_name for r in result.files)
+    assert outputs == [f"{new_sop}-2.dcm", f"{new_sop}.dcm"]
+    dup = result.files[1]
+    assert any(d.code == "DUPLICATE_SOP_INSTANCE" for d in dup.diagnostics)
+    assert dup.status == "warning"

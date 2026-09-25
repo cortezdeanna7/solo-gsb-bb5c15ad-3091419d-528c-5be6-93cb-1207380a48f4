@@ -133,6 +133,28 @@ curl http://localhost:8000/jobs/$JOB_ID/files
 curl -OJ http://localhost:8000/jobs/$JOB_ID/download
 ```
 
+### ZIP 同名条目与重复实例
+
+ZIP 中央目录允许出现**同名条目**（例如两个 `scan.dcm`，或 `./scan.dcm` 与
+`scan.dcm` 这类规范化后同址的名称）。服务按 **ZIP 条目**（而非成员名）解压：
+每个条目写入以条目序号命名的独立暂存文件，后续两遍 UID 收集、患者分组与匿名
+写出都读取该条目自己的字节——**同名条目不会互相覆盖，也不会重复处理末项**。
+
+逐文件结果（`files[]`）中：
+
+- `name` 为 **ZIP 原始成员名**（未规范化，同名条目会看到相同的名字）；
+- `entry_index` 为该条目在 ZIP 中央目录中的 **0 基序号**，同名条目以此区分。
+
+写出规则：
+
+- **同名不同 SOPInstanceUID**：各自正常写出为 `<新SOP UID>.dcm`，互不干扰；
+- **同名同 SOPInstanceUID**：属于重复实例，沿用现有规则——首个写出为
+  `<新SOP UID>.dcm`，后续依次改名 `<新SOP UID>-2.dcm`、`-3.dcm`……并给出
+  `DUPLICATE_SOP_INSTANCE` 警告（见[诊断码](#诊断码)）。
+
+`../` 路径穿越、绝对路径与符号链接/设备等非常规条目仍然整体拒绝；解压总大小
+与条目数量上限不变（见[配置](#配置环境变量)）。
+
 ### 按匿名 StudyInstanceUID 下载检查子集
 
 除全量下载外，还可以只下载某一个匿名检查，并由服务端**沿 SOP 引用自动补全**
@@ -1293,6 +1315,7 @@ else:
   "files": [
     {
       "name": "patient_1/rt/RS0001.dcm",
+      "entry_index": 2,              // ZIP 条目序号（0 基）；同名条目以此区分
       "status": "warning",           // ok | warning | error | skipped
       "output_name": "2.25.9391….dcm",
       "study_instance_uid":  "2.25.…",
@@ -1322,6 +1345,9 @@ else:
 `action` 含义：`REPLACE`（确定性替换）、`EMPTY`（置空保留标签）、
 `REMOVE`（整标签删除）。嵌套序列中的标签用点号路径标注，例如
 `ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0]…`。
+`name` 为 ZIP 原始成员名，`entry_index` 为条目在中央目录中的 0 基序号；
+同名条目（含 `./` 等规范化后同址的名称）各自独立处理，见
+[ZIP 同名条目与重复实例](#zip-同名条目与重复实例)。
 
 ### 诊断码
 
@@ -1370,6 +1396,8 @@ else:
 **安全**
 
 - 解压前校验 ZIP 条目路径（拒绝 `../` 穿越、绝对路径、符号链接/设备节点）。
+- 每个 ZIP 条目解压到以条目序号命名的独立暂存文件：同名（或 `./` 等规范化后
+  同址）条目互不覆盖，两遍扫描与匿名写出均按条目读取各自字节。
 - 解压总大小、条目数量设上限，防止 zip 炸弹；上传大小流式限制（超限返回 413）。
 - 容器以非 root 用户运行；任务数据放在独立 Docker volume。
 
@@ -1404,7 +1432,7 @@ else:
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、系列 KVP 分布、实例 PNG 预览、剂量 SR 照射事件、SEG 分割覆盖率、/health）
-│   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── anonymizer.py    # 逐条目独立暂存的安全解压 + 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dose_events.py   # 按匿名 SOP UID 解析 X-Ray Radiation Dose SR：CT 照射事件容器边界、逐事件 CTDIvol/DLP 与事件 DLP 合计
 │   ├── seg_coverage.py  # 按匿名 SOP UID 统计未压缩 BINARY SEG 覆盖率：逐帧源图像关联、同（源图像, 段号）1-bit 掩码并集
@@ -1420,7 +1448,7 @@ else:
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
 │   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率（301 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（308 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
