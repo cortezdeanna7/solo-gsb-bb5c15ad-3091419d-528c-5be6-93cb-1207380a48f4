@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import warnings
 import zipfile
 
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
@@ -109,6 +110,26 @@ def _rtstruct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: st
     dangling_item.ReferencedSOPInstanceUID = dangling_sop
     ds.ReferencedSOPSequence = [dangling_item]
     return _write_bytes(ds)
+
+
+def ct_like_bytes(sop_uid: str, series_uid: str, study_uid: str,
+                  patient_id: str, patient_name: str, frame_uid: str,
+                  pixels: bytes | None = None) -> bytes:
+    """构造最小合法 CT 影像字节（供同名条目等场景按 SOP / 像素区分来源）。"""
+    return _ct_like(sop_uid, series_uid, study_uid, patient_id,
+                    patient_name, frame_uid, pixels)
+
+
+def build_zip_bytes(entries: list[tuple[str, bytes]]) -> bytes:
+    """按给定 (条目名, 内容) 顺序构造 ZIP；允许重复 / 规范化后同址的条目名。"""
+    buf = io.BytesIO()
+    with warnings.catch_warnings():
+        # 测试故意写入重复条目名；zipfile 的 Duplicate name 警告属预期
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, blob in entries:
+                zf.writestr(name, blob)
+    return buf.getvalue()
 
 
 def build_sample_zip(path: str, seed: int = 1) -> dict:

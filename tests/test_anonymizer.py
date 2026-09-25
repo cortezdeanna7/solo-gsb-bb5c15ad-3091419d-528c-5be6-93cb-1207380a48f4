@@ -11,7 +11,7 @@ import pytest
 from app.anonymizer import Anonymizer, build_zip, safe_extract_zip
 from app.config import settings
 
-from .sample_data import build_sample_zip
+from .sample_data import build_sample_zip, build_zip_bytes, ct_like_bytes
 
 SECRET = "unit-test-secret-0123456789"
 
@@ -326,3 +326,116 @@ def test_too_many_files_rejected(tmp_path):
     with pytest.raises(ValueError):
         safe_extract_zip(str(many), str(dest),
                          settings.max_extracted_bytes, max_files=3)
+
+
+# --------------------------------------------------------------------------- #
+# ZIP 同名条目（重复成员名 / 规范化后同址）
+# --------------------------------------------------------------------------- #
+def _run_zip(tmp_path, zip_bytes, tag="ex"):
+    zp = tmp_path / f"{tag}.zip"
+    zp.write_bytes(zip_bytes)
+    ex = tmp_path / tag
+    ex.mkdir()
+    members = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    result = Anonymizer(secret=SECRET).run(
+        str(ex), members, str(tmp_path / f"out-{tag}"))
+    return result, members
+
+
+def test_duplicate_member_names_each_get_own_output(tmp_path):
+    """两个同名 scan.dcm 条目（不同 SOP）：各自独立处理与写出，互不覆盖。"""
+    pixels_a = bytes([7] * 32)
+    pixels_b = bytes([9] * 32)
+    blob_a = ct_like_bytes("1.2.3.200.1", "1.2.3.200.10", "1.2.3.200.20",
+                           "P-200", "Dup^One", "1.2.3.200.30", pixels=pixels_a)
+    blob_b = ct_like_bytes("1.2.3.200.2", "1.2.3.200.10", "1.2.3.200.20",
+                           "P-200", "Dup^One", "1.2.3.200.30", pixels=pixels_b)
+    result, members = _run_zip(
+        tmp_path, build_zip_bytes([("scan.dcm", blob_a), ("scan.dcm", blob_b)]))
+
+    # 每个条目独立暂存
+    assert len(members) == 2
+    assert len({m.staging_name for m in members}) == 2
+    assert [m.entry_index for m in members] == [0, 1]
+
+    reps = result.files
+    assert [r.name for r in reps] == ["scan.dcm", "scan.dcm"]
+    assert [r.entry_index for r in reps] == [0, 1]
+    assert all(r.status == "ok" for r in reps)
+    # 同名不同 SOP：各自写出为不同的匿名文件
+    out0, out1 = reps[0].output_name, reps[1].output_name
+    assert out0 and out1 and out0 != out1
+    assert reps[0].sop_instance_uid != reps[1].sop_instance_uid
+    # 两遍读取的都是各自字节：输出像素与源条目一一对应（未互相覆盖）
+    ds0 = pydicom.dcmread(os.path.join(result.output_dir, out0))
+    ds1 = pydicom.dcmread(os.path.join(result.output_dir, out1))
+    assert ds0.PixelData == pixels_a
+    assert ds1.PixelData == pixels_b
+
+
+def test_normalized_same_path_members_stay_independent(tmp_path):
+    """./、a/../ 等规范化后同址的条目同样各自独立暂存与处理。"""
+    names = ["./scan.dcm", "scan.dcm", "a/../scan.dcm"]
+    blobs = [
+        ct_like_bytes(f"1.2.3.201.{i}", "1.2.3.201.10", "1.2.3.201.20",
+                      "P-201", "Dup^Two", "1.2.3.201.30", pixels=bytes([i] * 32))
+        for i in (1, 2, 3)
+    ]
+    result, members = _run_zip(
+        tmp_path, build_zip_bytes(list(zip(names, blobs))))
+
+    # 三者规范化相对路径相同，但暂存文件各自独立
+    assert len({m.rel_path for m in members}) == 1
+    assert len({m.staging_name for m in members}) == 3
+    # 原始条目名原样回显，条目序号可区分
+    assert [r.name for r in result.files] == names
+    assert [r.entry_index for r in result.files] == [0, 1, 2]
+    assert len({r.output_name for r in result.files}) == 3
+    for i, rep in enumerate(result.files):
+        ds = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+        assert ds.PixelData == bytes([i + 1] * 32)
+
+
+def test_duplicate_member_same_sop_keeps_duplicate_rule(tmp_path):
+    """同名且同 SOPInstanceUID：沿用重复实例改名规则（<uid>.dcm / <uid>-2.dcm）。"""
+    pixels_a = bytes([3] * 32)
+    pixels_b = bytes([4] * 32)
+    blob_a = ct_like_bytes("1.2.3.202.1", "1.2.3.202.10", "1.2.3.202.20",
+                           "P-202", "Dup^Three", "1.2.3.202.30", pixels=pixels_a)
+    blob_b = ct_like_bytes("1.2.3.202.1", "1.2.3.202.10", "1.2.3.202.20",
+                           "P-202", "Dup^Three", "1.2.3.202.30", pixels=pixels_b)
+    result, _ = _run_zip(
+        tmp_path, build_zip_bytes([("scan.dcm", blob_a), ("scan.dcm", blob_b)]))
+
+    reps = result.files
+    assert len(reps) == 2
+    new_sop = reps[0].sop_instance_uid
+    assert reps[1].sop_instance_uid == new_sop
+    assert {r.output_name for r in reps} == {f"{new_sop}.dcm", f"{new_sop}-2.dcm"}
+    # 后处理的条目给出重复实例警告
+    second = next(r for r in reps if r.entry_index == 1)
+    assert "DUPLICATE_SOP_INSTANCE" in [d.code for d in second.diagnostics]
+    # 两份输出各自保留源条目字节
+    first = next(r for r in reps if r.entry_index == 0)
+    ds_first = pydicom.dcmread(os.path.join(result.output_dir, first.output_name))
+    ds_second = pydicom.dcmread(os.path.join(result.output_dir, second.output_name))
+    assert ds_first.PixelData == pixels_a
+    assert ds_second.PixelData == pixels_b
+
+
+def test_duplicate_member_names_invalid_and_valid(tmp_path):
+    """同名条目中一个非法：只影响对应条目，另一份正常写出（不再互相覆盖）。"""
+    good = ct_like_bytes("1.2.3.203.1", "1.2.3.203.10", "1.2.3.203.20",
+                         "P-203", "Dup^Four", "1.2.3.203.30")
+    result, _ = _run_zip(
+        tmp_path, build_zip_bytes([("scan.dcm", b"not dicom"), ("scan.dcm", good)]))
+
+    bad, ok = result.files
+    assert bad.entry_index == 0
+    assert bad.status == "error"
+    assert any(d.code == "INVALID_DICOM" for d in bad.diagnostics)
+    assert ok.entry_index == 1
+    assert ok.status == "ok"
+    assert ok.output_name and ok.output_name.endswith(".dcm")

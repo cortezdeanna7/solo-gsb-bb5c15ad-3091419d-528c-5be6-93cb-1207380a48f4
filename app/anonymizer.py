@@ -1,7 +1,8 @@
 """DICOM 批量匿名化核心引擎。
 
 职责：
-1. 安全解压 ZIP（路径穿越 / zip 炸弹 / 符号链接防护）；
+1. 安全解压 ZIP（路径穿越 / zip 炸弹 / 符号链接防护；每个文件条目独立暂存，
+   同名或规范化后同址的条目互不覆盖）；
 2. 扫描全部文件，识别非法 DICOM，按患者身份分组并建立 UID 全局映射；
 3. 重写 Patient / Study / Series / SOP / FrameOfReference UID 及身份字段，
    递归处理所有序列内的 UID 引用，保证检查关系不变；
@@ -71,8 +72,9 @@ class Change:
 
 @dataclass
 class FileReport:
-    name: str
+    name: str  # 压缩包内原始条目名（同名条目原样重复，需结合 entry_index 区分）
     status: str  # ok | warning | error | skipped
+    entry_index: int = 0  # ZIP 文件条目序号（0 基，按包内文件条目顺序，目录不计）
     output_name: Optional[str] = None
     sop_instance_uid: Optional[str] = None
     study_instance_uid: Optional[str] = None
@@ -89,6 +91,7 @@ class FileReport:
         )
         return {
             "name": self.name,
+            "entry_index": self.entry_index,
             "status": self.status,
             "output_name": self.output_name,
             "patient_key": self.patient_key,
@@ -169,25 +172,46 @@ def _file_sha16(path: str) -> str:
 # --------------------------------------------------------------------------- #
 # ZIP 安全解压
 # --------------------------------------------------------------------------- #
+@dataclass
+class ExtractedMember:
+    """一个 ZIP 文件条目的独立暂存描述。
+
+    每个文件条目（即使同名、或经 ./ 等规范化后同址）都解压到独立的暂存
+    文件，后续两遍扫描（UID 收集 / 患者分组）与匿名写出均按 staging_name
+    读取各自字节，互不覆盖。
+    """
+
+    name: str          # 压缩包内原始条目名（逐文件结果中原样回显）
+    rel_path: str      # 规范化后的相对路径（仅供展示 / 文件类型判断）
+    entry_index: int   # 文件条目序号（0 基，按压缩包内文件条目顺序，目录不计）
+    staging_name: str  # 独立暂存文件（相对解压目录，只含条目序号）
+
+
 def safe_extract_zip(
     zip_path: str,
     dest: str,
     max_total_bytes: int,
     max_files: int,
-) -> list[str]:
-    """解压 ZIP，返回解压出的文件相对路径列表；带完整的安全校验。"""
+) -> list[ExtractedMember]:
+    """解压 ZIP，为每个文件条目建立独立暂存文件；带完整的安全校验。
+
+    同名（或 ./ 等规范化后同址）条目各自占用独立暂存文件，不会互相覆盖；
+    ../ 穿越、绝对路径与符号链接/设备等非常规条目一律拒绝；条目数量与解压
+    总大小受限（声明值预审 + 实际写出字节流式兜底）。
+    """
     try:
         zf = zipfile.ZipFile(zip_path)
     except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"无法打开 ZIP：{exc}") from exc
 
-    members: list[zipfile.ZipInfo] = []
-    total = 0
+    members: list[ExtractedMember] = []
     with zf:
         infos = zf.infolist()
         if len(infos) > max_files:
             raise ValueError(f"压缩包内文件数量超过上限 {max_files}")
         dest_abs = os.path.abspath(dest)
+        planned: list[tuple[zipfile.ZipInfo, str]] = []
+        total = 0
         for info in infos:
             # 规范化后必须仍在目标目录内，防止 ../ 路径穿越与绝对路径
             target = os.path.abspath(os.path.join(dest, info.filename))
@@ -211,23 +235,43 @@ def safe_extract_zip(
             total += info.file_size
             if total > max_total_bytes:
                 raise ValueError("解压后总大小超过上限（可能为 zip 炸弹）")
-            members.append(info)
+            planned.append((info, rel))
 
-        for info in members:
-            zf.extract(info, dest)
-            target = os.path.abspath(os.path.join(dest, info.filename))
-            # 二次确认：解压后若磁盘上是符号链接，拒绝
-            if os.path.islink(target):
-                raise ValueError(f"检测到符号链接：{info.filename}")
-            os.chmod(target, 0o600)
-
-    rels = [
-        os.path.relpath(
-            os.path.abspath(os.path.join(dest, m.filename)), os.path.abspath(dest)
-        ).replace(os.sep, "/")
-        for m in members
-    ]
-    return sorted(rels)
+        # 逐条目写入独立暂存文件：暂存名只含条目序号，与原始条目名完全解耦，
+        # 因此同名 / 规范化后同址的条目不可能互相覆盖；暂存路径由服务端生成，
+        # 本身免疫路径穿越，无需再按条目名落盘
+        staging_dir = os.path.join(dest_abs, "entries")
+        os.makedirs(staging_dir, exist_ok=True)
+        written_total = 0
+        for idx, (info, rel) in enumerate(planned):
+            staging_name = f"entries/{idx:06d}"
+            staging_path = os.path.join(dest_abs, staging_name)
+            written = 0
+            with zf.open(info, "r") as src, open(staging_path, "wb") as dst:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    written_total += len(chunk)
+                    if written > info.file_size:
+                        raise ValueError(
+                            "条目实际解压大小超过声明值（可能为 zip 炸弹）："
+                            f"{info.filename}"
+                        )
+                    if written_total > max_total_bytes:
+                        raise ValueError("解压后总大小超过上限（可能为 zip 炸弹）")
+                    dst.write(chunk)
+            os.chmod(staging_path, 0o600)
+            members.append(
+                ExtractedMember(
+                    name=info.filename,
+                    rel_path=rel,
+                    entry_index=idx,
+                    staging_name=staging_name,
+                )
+            )
+    return members
 
 
 # --------------------------------------------------------------------------- #
@@ -546,9 +590,14 @@ class Anonymizer:
     def run(
         self,
         extracted_dir: str,
-        relative_paths: list[str],
+        members: list[ExtractedMember],
         output_dir: str,
     ) -> JobResult:
+        """对 safe_extract_zip 暂存的条目执行两遍扫描与匿名写出。
+
+        每个 ZIP 条目（含同名条目）读取各自 staging_name 下的字节，
+        逐文件结果回显原始条目名与条目序号。
+        """
         os.makedirs(output_dir, exist_ok=True)
         self._reported_missing = set()
         self._missing_seed = ""
@@ -559,11 +608,13 @@ class Anonymizer:
         identities: dict[str, list[FileReport]] = {}
 
         # ---- 第一遍：识别 DICOM、收集 UID、患者分组 -------------------- #
-        for rel in relative_paths:
-            path = os.path.join(extracted_dir, rel)
-            report = FileReport(name=rel, status="ok")
+        for member in members:
+            path = os.path.join(extracted_dir, member.staging_name)
+            report = FileReport(
+                name=member.name, status="ok", entry_index=member.entry_index
+            )
             reports.append(report)
-            if os.path.basename(rel).upper() == "DICOMDIR":
+            if os.path.basename(member.rel_path).upper() == "DICOMDIR":
                 report.status = "skipped"
                 report.diagnostics.append(
                     Diagnostic("DICOMDIR_SKIPPED", "info",

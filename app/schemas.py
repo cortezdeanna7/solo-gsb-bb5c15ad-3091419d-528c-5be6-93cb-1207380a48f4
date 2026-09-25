@@ -22,7 +22,11 @@ class ChangeOut(BaseModel):
 
 
 class FileOut(BaseModel):
-    name: str
+    name: str = Field(description="ZIP 内原始条目名（同名条目原样重复出现）")
+    entry_index: int = Field(
+        description="ZIP 文件条目序号（0 基，按压缩包内文件条目顺序，目录条目不计）；"
+        "同名条目以此区分"
+    )
     status: str = Field(description="ok | warning | error | skipped")
     output_name: Optional[str] = None
     patient_key: Optional[str] = None

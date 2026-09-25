@@ -4,10 +4,11 @@ from __future__ import annotations
 import io
 import zipfile
 
+import pydicom
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.sample_data import build_sample_zip
+from tests.sample_data import build_sample_zip, build_zip_bytes, ct_like_bytes
 
 
 @pytest.fixture()
@@ -161,6 +162,46 @@ def test_same_secret_cross_batch_same_pseudonym(client, sample_zip_bytes):
     p1 = {p["key"]: p["new_patient_id"] for p in j1["patients"]}
     p2 = {p["key"]: p["new_patient_id"] for p in j2["patients"]}
     assert p1 == p2
+
+
+def test_upload_zip_with_duplicate_member_names(client):
+    """ZIP 内两个同名 scan.dcm 条目（不同 SOP）：各自独立匿名化与写出。"""
+    pixels_a = bytes([5] * 32)
+    pixels_b = bytes([6] * 32)
+    zip_bytes = build_zip_bytes([
+        ("scan.dcm", ct_like_bytes("1.2.3.300.1", "1.2.3.300.10", "1.2.3.300.20",
+                                   "P-300", "Api^Dup", "1.2.3.300.30",
+                                   pixels=pixels_a)),
+        ("scan.dcm", ct_like_bytes("1.2.3.300.2", "1.2.3.300.10", "1.2.3.300.20",
+                                   "P-300", "Api^Dup", "1.2.3.300.30",
+                                   pixels=pixels_b)),
+    ])
+    r = client.post(
+        "/jobs",
+        files={"file": ("dup.zip", zip_bytes, "application/zip")},
+        data={"secret": "dup-secret-123456"},
+    )
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["status"] == "ready"
+    assert job["file_count"] == 2
+    assert job["output_file_count"] == 2
+    files = job["files"]
+    # 原始条目名原样回显，条目序号区分同名条目
+    assert [f["name"] for f in files] == ["scan.dcm", "scan.dcm"]
+    assert [f["entry_index"] for f in files] == [0, 1]
+    assert len({f["output_name"] for f in files}) == 2
+
+    # 下载的匿名 ZIP 含两个文件，像素各自对应源条目（未互相覆盖）
+    r2 = client.get(f"/jobs/{job['id']}/download")
+    assert r2.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(r2.content)) as zf:
+        names = zf.namelist()
+        assert len(names) == 2
+        pixels = sorted(
+            pydicom.dcmread(io.BytesIO(zf.read(n))).PixelData for n in names
+        )
+        assert pixels == [pixels_a, pixels_b]
 
 
 # --------------------------------------------------------------------------- #
